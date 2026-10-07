@@ -13,7 +13,10 @@
 #
 """Ahead-of-time Arm Ethos-U backend built on the shared TOSA pipeline."""
 
+import contextlib
 import logging
+from collections.abc import Callable, Iterator, Sequence
+from contextvars import ContextVar
 from typing import final, List
 
 from executorch.backends.arm.arm_vela import vela_compile, VelaCompileResult
@@ -27,6 +30,38 @@ from torch.export.exported_program import ExportedProgram
 
 # debug functionality
 logger = logging.getLogger(__name__)
+
+VelaCompiler = Callable[[Sequence[str]], VelaCompileResult]
+EthosUPreprocessObserver = Callable[
+    [bytes, tuple[str, ...], VelaCompiler],
+    tuple[VelaCompileResult, object | None],
+]
+
+_PREPROCESS_OBSERVER: ContextVar[EthosUPreprocessObserver | None] = ContextVar(
+    "ethosu_preprocess_observer", default=None
+)
+_COMPILER_ARGS_OVERRIDE: ContextVar[tuple[str, ...] | None] = ContextVar(
+    "ethosu_compiler_args_override", default=None
+)
+
+
+@contextlib.contextmanager
+def observe_ethosu_preprocess(
+    observer: EthosUPreprocessObserver,
+) -> Iterator[None]:
+    """Observe exact TOSA-to-Vela compilation in the current execution context.
+
+    The observer receives immutable compiler arguments and a callback that it
+    must call exactly once. It returns that callback's result plus optional
+    metadata to attach to the corresponding lowered delegate.
+    """
+    if not callable(observer):
+        raise TypeError("Ethos-U preprocess observer must be callable")
+    token = _PREPROCESS_OBSERVER.set(observer)
+    try:
+        yield
+    finally:
+        _PREPROCESS_OBSERVER.reset(token)
 
 
 @final
@@ -54,7 +89,10 @@ class EthosUBackend(BackendDetails):
             VelaCompileResult: Binary stream and external payloads from Vela.
 
         """
-        compile_flags = compile_spec.compiler_flags
+        compiler_args = _COMPILER_ARGS_OVERRIDE.get()
+        compile_flags = list(
+            compile_spec.compiler_flags if compiler_args is None else compiler_args
+        )
 
         if len(compile_flags) == 0:
             # Not testing for compile_flags correctness here, just that they are
@@ -83,6 +121,65 @@ class EthosUBackend(BackendDetails):
             ),
             max_scratch_size=compile_spec.max_scratch_size,
         )
+
+    @staticmethod
+    def _compile_with_observer(
+        tosa_flatbuffer: bytes,
+        compile_spec: EthosUCompileSpec,
+    ) -> tuple[VelaCompileResult, object | None]:
+        observer = _PREPROCESS_OBSERVER.get()
+        if observer is None:
+            return (
+                EthosUBackend._compile_tosa_flatbuffer(
+                    tosa_flatbuffer, compile_spec
+                ),
+                None,
+            )
+
+        compiler_args = tuple(compile_spec.compiler_flags)
+        compiler_called = False
+        compiler_result: VelaCompileResult | None = None
+
+        def compile_once(replacement_args: Sequence[str]) -> VelaCompileResult:
+            nonlocal compiler_called, compiler_result
+            if compiler_called:
+                raise RuntimeError(
+                    "Ethos-U preprocess compiler callback may be called only once"
+                )
+            compiler_called = True
+            if isinstance(replacement_args, (str, bytes)) or not isinstance(
+                replacement_args, Sequence
+            ):
+                raise TypeError(
+                    "Ethos-U compiler arguments must be a sequence of strings"
+                )
+            materialized_args = tuple(replacement_args)
+            if any(not isinstance(arg, str) for arg in materialized_args):
+                raise TypeError(
+                    "Ethos-U compiler arguments must be a sequence of strings"
+                )
+            token = _COMPILER_ARGS_OVERRIDE.set(materialized_args)
+            try:
+                compiler_result = EthosUBackend._compile_tosa_flatbuffer(
+                    tosa_flatbuffer,
+                    compile_spec,
+                )
+            finally:
+                _COMPILER_ARGS_OVERRIDE.reset(token)
+            return compiler_result
+
+        observed_result, delegate_metadata = observer(
+            tosa_flatbuffer, compiler_args, compile_once
+        )
+        if not compiler_called:
+            raise RuntimeError(
+                "Ethos-U preprocess observer did not call the compiler callback"
+            )
+        if observed_result is not compiler_result:
+            raise RuntimeError(
+                "Ethos-U preprocess observer must return the compiler callback result"
+            )
+        return observed_result, delegate_metadata
 
     @staticmethod
     def preprocess(
@@ -114,11 +211,14 @@ class EthosUBackend(BackendDetails):
         # which can be passed on to next compilation step.
         tosa_preprocess = TOSABackend._preprocess(edge_program, tosa_compile_spec)
 
-        compile_result = EthosUBackend._compile_tosa_flatbuffer(
+        compile_result, delegate_metadata = EthosUBackend._compile_with_observer(
             tosa_preprocess.processed_bytes, compile_spec
         )
         if not compile_result.external_blocks:
-            return PreprocessResult(processed_bytes=compile_result.processed_bytes)
+            return PreprocessResult(
+                processed_bytes=compile_result.processed_bytes,
+                _delegate_info_meta=delegate_metadata,
+            )
 
         data_store = NamedDataStore()
         for external_block in compile_result.external_blocks:
@@ -131,4 +231,5 @@ class EthosUBackend(BackendDetails):
         return PreprocessResult(
             processed_bytes=compile_result.processed_bytes,
             data_store_output=data_store.get_named_data_store_output(),
+            _delegate_info_meta=delegate_metadata,
         )
